@@ -26,9 +26,9 @@ TMP = Path(os.environ.get("BR_TMP", "/tmp"))
 
 MAX_WORKERS = 8
 WORKER_MS = 2000
-CPU_PER_MS = 2.0  # scorer CPU ms per recorded test ms (measured ~1.7x a laptop)
-CHILD_MS = 300  # marginal CPU of adding a commit to a batched run
-CHILD_PURGE_MS = 300  # extra when sqlglot itself has to be re-imported (shared by a batch)
+CPU_PER_MS = 5.0  # scorer CPU ms per recorded test ms (measured ~5x from practice runs)
+CHILD_MS = 2000  # fixed CPU cost of one child run on the scorer
+CHILD_PURGE_MS = 2500  # extra when sqlglot itself has to be re-imported
 T0 = time.time()
 DEADLINE = float(os.environ.get("BR_DEADLINE", "120"))  # stop starting runs after this (s)
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
