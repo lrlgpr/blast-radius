@@ -1518,12 +1518,99 @@ class Job:
         self.equiv = False
 
 
+def _touches_test_py(job):
+    return any(f.path.startswith("tests/") and f.path.endswith(".py") for f in job.files)
+
+
+def make_batches(jobs, sel, max_jobs=12, max_ms=15000):
+    """Group jobs that cannot see each other's change into one test run: their
+    edited files differ, their candidate tests differ, and none of their
+    candidates opens a file another member edits. One child then pays pytest
+    start-up, sqlglot import and test-module import once for the group."""
+    m = sel.m
+    singles, batches = [], []
+    for purge in (False, True):
+        cur = None
+        for j in [j for j in jobs if j.run and j.purge == purge]:
+            if _touches_test_py(j) or any(f.binary for f in j.files):
+                singles.append(j)
+                continue
+            paths = {f.path for f in j.files} | {f.old for f in j.files if f.old}
+            readers = set()
+            for pth in paths:
+                readers |= m.files.get(pth, set())
+            est = sum(m.secs[n] for n in j.run)
+            ok = (
+                cur is not None
+                and len(cur["jobs"]) < max_jobs
+                and cur["ms"] + est <= max_ms
+                and not (paths & cur["paths"])
+                and not (j.run & cur["run"])
+                and not (readers & cur["run"])
+                and not (j.run & cur["readers"])
+            )
+            if not ok:
+                cur = {"jobs": [], "paths": set(), "run": set(), "readers": set(), "ms": 0}
+                batches.append(cur)
+            cur["jobs"].append(j)
+            cur["paths"] |= paths
+            cur["run"] |= j.run
+            cur["readers"] |= readers
+            cur["ms"] += est
+    out = []
+    for b in batches:
+        if len(b["jobs"]) == 1:
+            singles.append(b["jobs"][0])
+            continue
+        files = [f for j in b["jobs"] for f in j.files]
+        mods = []
+        for j in b["jobs"]:
+            mods += [x for x in j.check_mods if x not in mods]
+        bj = Job("+".join(j.cid for j in b["jobs"]), files, set(b["run"]), set(), any(j.purge for j in b["jobs"]), mods)
+        bj.members = b["jobs"]
+        out.append(bj)
+    return out, singles
+
+
+def run_all(jobs, sel, tree):
+    batches, singles = make_batches(jobs, sel)
+    others = [j for j in jobs if not j.run and j.purge and j.check_mods]
+    if len(others) > 1:
+        # import-only checks: one child imports every edited module (patches are file-disjoint)
+        paths = [f.path for j in others for f in j.files]
+        if len(paths) == len(set(paths)):
+            mods = []
+            for j in others:
+                mods += [x for x in j.check_mods if x not in mods]
+            bj = Job("+".join(j.cid for j in others), [f for j in others for f in j.files], set(), set(), True, mods)
+            bj.members = others
+            batches.append(bj)
+            others = []
+    log(f"runs: {len(batches)} batches ({sum(len(b.members) for b in batches)} commits), {len(singles) + len(others)} single")
+    run_jobs(batches + singles + others, sel, tree)
+    for b in batches + singles + others:
+        log(f"run {b.cid}: tests={len(b.run)} est={sum(sel.m.secs[n] for n in b.run)/1000:.2f}s cpu={getattr(b, 'cpu', 0):.2f}s purge={b.purge}")
+    retry = []
+    for b in batches:
+        trouble = b.killed or b.error or b.import_broken or b.collect_failed or (b.run - b.done)
+        if trouble:
+            log("batch had trouble, rerunning alone:", b.cid)
+            retry += b.members
+            continue
+        for j in b.members:
+            j.failed = b.failed & j.run
+            j.done = b.done & j.run
+            j.cpu = getattr(b, "cpu", 0) / len(b.members)
+    if retry:
+        run_jobs(retry, sel, tree)
+
+
 def run_jobs(jobs, sel, tree):
     m = sel.m
     nodeid_to_num = {v: k for k, v in m.id_of.items()}
     trees = [tree]
     free = [0]
-    queue = [j for j in jobs if j.run or (j.purge and j.check_mods)]
+    queue = list(jobs)
     # longest first for better packing on 2 cores
     # fixture/test-only jobs first: they reuse the parent's imports
     queue.sort(key=lambda j: j.purge)
@@ -1693,7 +1780,7 @@ def main(emit):
         jobs.append(job)
     try:
         preload_tests(jobs, sel)
-        run_jobs(jobs, sel, tree)
+        run_all(jobs, sel, tree)
     except Exception as e:
         log("runner crashed", repr(e))
         for j in jobs:
