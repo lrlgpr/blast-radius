@@ -26,9 +26,9 @@ TMP = Path(os.environ.get("BR_TMP", "/tmp"))
 
 MAX_WORKERS = 8
 WORKER_MS = 2000
-CPU_PER_MS = 4.0  # scorer CPU ms per recorded test ms (measured: ~4x a laptop)
-CHILD_MS = 2000  # fixed CPU cost of one child run on the scorer
-CHILD_PURGE_MS = 2500  # extra when sqlglot itself has to be re-imported
+CPU_PER_MS = 2.0  # scorer CPU ms per recorded test ms (measured ~1.7x a laptop)
+CHILD_MS = 300  # marginal CPU of adding a commit to a batched run
+CHILD_PURGE_MS = 300  # extra when sqlglot itself has to be re-imported (shared by a batch)
 T0 = time.time()
 DEADLINE = float(os.environ.get("BR_DEADLINE", "120"))  # stop starting runs after this (s)
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -1485,9 +1485,20 @@ PRELOAD = (
 )
 
 
+HEAVY_PRELOAD = {"pandas", "numpy", "duckdb", "setuptools", "multiprocessing", "sqlite3", "pdb", "doctest", "dateutil", "pytz"}
+
+
 def preload_tests(jobs, sel):
     """Import the test modules that fixture/test-data jobs need, once, in the parent."""
     import importlib
+
+    if any(j.run for j in jobs):
+        for mod in PRELOAD:
+            if mod.split(".")[0] in HEAVY_PRELOAD:
+                try:
+                    importlib.import_module(mod)
+                except Exception:
+                    pass
 
     files = set()
     for j in jobs:
@@ -1575,17 +1586,27 @@ def make_batches(jobs, sel, max_jobs=12, max_ms=15000):
 def run_all(jobs, sel, tree):
     batches, singles = make_batches(jobs, sel)
     others = [j for j in jobs if not j.run and j.purge and j.check_mods]
-    if len(others) > 1:
-        # import-only checks: one child imports every edited module (patches are file-disjoint)
-        paths = [f.path for j in others for f in j.files]
-        if len(paths) == len(set(paths)):
-            mods = []
-            for j in others:
-                mods += [x for x in j.check_mods if x not in mods]
-            bj = Job("+".join(j.cid for j in others), [f for j in others for f in j.files], set(), set(), True, mods)
-            bj.members = others
-            batches.append(bj)
-            others = []
+    # import-only checks: pack file-disjoint ones into a few children
+    groups = []
+    for j in others:
+        paths = {f.path for f in j.files}
+        g = next((g for g in groups if not (g[0] & paths) and len(g[1]) < 20), None)
+        if g is None:
+            g = (set(), [])
+            groups.append(g)
+        g[0].update(paths)
+        g[1].append(j)
+    others = []
+    for paths, members in groups:
+        if len(members) == 1:
+            others.append(members[0])
+            continue
+        mods = []
+        for j in members:
+            mods += [x for x in j.check_mods if x not in mods]
+        bj = Job("+".join(j.cid for j in members), [f for j in members for f in j.files], set(), set(), True, mods)
+        bj.members = members
+        batches.append(bj)
     log(f"runs: {len(batches)} batches ({sum(len(b.members) for b in batches)} commits), {len(singles) + len(others)} single")
     run_jobs(batches + singles + others, sel, tree)
     for b in batches + singles + others:
@@ -1739,6 +1760,8 @@ def main(emit):
     import importlib
 
     for mod in PRELOAD:
+        if mod.split(".")[0] in HEAVY_PRELOAD:
+            continue  # imported later, only if some commit runs tests
         try:
             importlib.import_module(mod)
         except Exception:
