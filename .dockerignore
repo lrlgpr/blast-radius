@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!requirements.lock
+!selector.py
+!map.json
+!tools/fetch_sqlglot.py
